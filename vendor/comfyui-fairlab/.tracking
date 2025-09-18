@@ -1,0 +1,16 @@
+.github/workflows/publish.yml
+.gitignore
+.vscode/settings.json
+LICENSE
+README.md
+__init__.py
+image_utility.py
+js/restart.svg
+js/web.js
+logic.py
+ollama.py
+pyproject.toml
+requirements.txt
+text_utility.py
+translate_utility.py
+utility.py

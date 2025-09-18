@@ -1,25 +1,22 @@
-# Build argument for base image selection
+# ---------- Build args ----------
 ARG BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
-# Stage 1: Base image with common dependencies
+# ---------- Stage: base (final efetivo) ----------
 FROM ${BASE_IMAGE} AS base
 
-# Build arguments for this stage with sensible defaults for standalone builds
+# Args de build (mantidos do template)
 ARG COMFYUI_VERSION=latest
 ARG CUDA_VERSION_FOR_COMFY
 ARG ENABLE_PYTORCH_UPGRADE=false
 ARG PYTORCH_INDEX_URL
 
-# Prevents prompts from packages asking for user input during installation
+# Ambientes úteis
 ENV DEBIAN_FRONTEND=noninteractive
-# Prefer binary wheels over source distributions for faster pip installations
 ENV PIP_PREFER_BINARY=1
-# Ensures output from python is printed immediately to the terminal without buffering
 ENV PYTHONUNBUFFERED=1
-# Speed up some cmake builds
 ENV CMAKE_BUILD_PARALLEL_LEVEL=8
 
-# Install Python, git and other necessary tools
+# Dependências de SO
 RUN apt-get update && apt-get install -y \
     python3.12 \
     python3.12-venv \
@@ -31,110 +28,88 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libxrender1 \
     ffmpeg \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && ln -sf /usr/bin/pip3 /usr/bin/pip
+ && ln -sf /usr/bin/python3.12 /usr/bin/python \
+ && ln -sf /usr/bin/pip3 /usr/bin/pip \
+ && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
-# Clean up to reduce image size
-RUN apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
-
-# Install uv (latest) using official installer and create isolated venv
+# Instala uv e cria venv isolada
 RUN wget -qO- https://astral.sh/uv/install.sh | sh \
-    && ln -s /root/.local/bin/uv /usr/local/bin/uv \
-    && ln -s /root/.local/bin/uvx /usr/local/bin/uvx \
-    && uv venv /opt/venv
+ && ln -s /root/.local/bin/uv /usr/local/bin/uv \
+ && ln -s /root/.local/bin/uvx /usr/local/bin/uvx \
+ && uv venv /opt/venv
 
-# Use the virtual environment for all subsequent commands
+# Usa a venv em tudo
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# Install comfy-cli + dependencies needed by it to install ComfyUI
+# comfy-cli e deps
 RUN uv pip install comfy-cli pip setuptools wheel
 
-# Install ComfyUI
+# Instala ComfyUI (via comfy-cli)
 RUN if [ -n "${CUDA_VERSION_FOR_COMFY}" ]; then \
       /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --cuda-version "${CUDA_VERSION_FOR_COMFY}" --nvidia; \
     else \
       /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --nvidia; \
     fi
 
-# Upgrade PyTorch if needed (for newer CUDA versions)
+# (Opcional) Upgrade de PyTorch se precisar de outra CUDA
 RUN if [ "$ENABLE_PYTORCH_UPGRADE" = "true" ]; then \
       uv pip install --force-reinstall torch torchvision torchaudio --index-url ${PYTORCH_INDEX_URL}; \
     fi
 
-# Change working directory to ComfyUI
+# Diretório de trabalho do ComfyUI
 WORKDIR /comfyui
 
-# Support for the network volume
+# ---------- Extra model paths (oficial) ----------
+# Este arquivo já aponta para /runpod-volume/models/*
 ADD src/extra_model_paths.yaml ./
 
-# Go back to the root
+# Volta para raiz
 WORKDIR /
 
-# Install Python runtime dependencies for the handler
+# ---------- Runtime do worker ----------
 RUN uv pip install runpod requests websocket-client
 
-# Add application code and scripts
+# Scripts do worker
 ADD src/start.sh handler.py test_input.json ./
 RUN chmod +x /start.sh
 
-# Add script to install custom nodes
+# Manager helper scripts
 COPY scripts/comfy-node-install.sh /usr/local/bin/comfy-node-install
 RUN chmod +x /usr/local/bin/comfy-node-install
 
-# Prevent pip from asking for confirmation during uninstall steps in custom nodes
 ENV PIP_NO_INPUT=1
 
-# Copy helper script to switch Manager network mode at container start
 COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
-# Set the default command to run when starting the container
+# ---------- Custom Nodes ----------
+# Coloque todos os nodes em vendor/<node> no seu repo antes do build
+# Ex.: vendor/ComfyUI-WD14-Tagger/, vendor/was-node-suite-comfyui/, etc.
+COPY vendor/ /comfyui/custom_nodes/
+
+# Instala requirements de TODOS os nodes, exceto WD14; WD14 por último
+RUN set -eux; \
+    WD14_DIR="/comfyui/custom_nodes/ComfyUI-WD14-Tagger"; \
+    # instala primeiro os outros
+    if [ -d /comfyui/custom_nodes ]; then \
+      find /comfyui/custom_nodes -maxdepth 2 -type f -name requirements.txt \
+        ! -path "${WD14_DIR}/*" -print -exec uv pip install --no-cache-dir -r {} \; ; \
+    fi; \
+    # agora o WD14 por ÚLTIMO (para vencer conflitos)
+    if [ -f "${WD14_DIR}/requirements.txt" ]; then \
+      uv pip install --upgrade --no-cache-dir -r "${WD14_DIR}/requirements.txt"; \
+    fi; \
+    python -m pip check || true
+
+# ---------- Modelos via Network Volume ----------
+# NADA é baixado na build; os modelos virão do volume montado em /runpod-volume
+# O extra_model_paths.yaml já aponta para /runpod-volume/models/*
+# (Se quiser, crie as pastas padrão no primeiro boot do container)
+RUN mkdir -p /runpod-volume/models
+
+# Comando padrão
 CMD ["/start.sh"]
 
-# Stage 2: Download models
-FROM base AS downloader
-
-ARG HUGGINGFACE_ACCESS_TOKEN
-# Set default model type if none is provided
-ARG MODEL_TYPE=flux1-dev-fp8
-
-# Change working directory to ComfyUI
-WORKDIR /comfyui
-
-# Create necessary directories upfront
-RUN mkdir -p models/checkpoints models/vae models/unet models/clip
-
-# Download checkpoints/vae/unet/clip models to include in image based on model type
-RUN if [ "$MODEL_TYPE" = "sdxl" ]; then \
-      wget -q -O models/checkpoints/sd_xl_base_1.0.safetensors https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors && \
-      wget -q -O models/vae/sdxl_vae.safetensors https://huggingface.co/stabilityai/sdxl-vae/resolve/main/sdxl_vae.safetensors && \
-      wget -q -O models/vae/sdxl-vae-fp16-fix.safetensors https://huggingface.co/madebyollin/sdxl-vae-fp16-fix/resolve/main/sdxl_vae.safetensors; \
-    fi
-
-RUN if [ "$MODEL_TYPE" = "sd3" ]; then \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/checkpoints/sd3_medium_incl_clips_t5xxlfp8.safetensors https://huggingface.co/stabilityai/stable-diffusion-3-medium/resolve/main/sd3_medium_incl_clips_t5xxlfp8.safetensors; \
-    fi
-
-RUN if [ "$MODEL_TYPE" = "flux1-schnell" ]; then \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/unet/flux1-schnell.safetensors https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors && \
-      wget -q -O models/clip/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors && \
-      wget -q -O models/clip/t5xxl_fp8_e4m3fn.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors && \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/vae/ae.safetensors https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors; \
-    fi
-
-RUN if [ "$MODEL_TYPE" = "flux1-dev" ]; then \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/unet/flux1-dev.safetensors https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors && \
-      wget -q -O models/clip/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors && \
-      wget -q -O models/clip/t5xxl_fp8_e4m3fn.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors && \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/vae/ae.safetensors https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors; \
-    fi
-
-RUN if [ "$MODEL_TYPE" = "flux1-dev-fp8" ]; then \
-      wget -q -O models/checkpoints/flux1-dev-fp8.safetensors https://huggingface.co/Comfy-Org/flux1-dev/resolve/main/flux1-dev-fp8.safetensors; \
-    fi
-
-# Stage 3: Final image
+# ---------- Stage final (mantido por compatibilidade) ----------
 FROM base AS final
-
-# Copy models from stage 2 to the final image
-COPY --from=downloader /comfyui/models /comfyui/models
+# Sem cópias adicionais: a imagem final é o que construímos acima.
