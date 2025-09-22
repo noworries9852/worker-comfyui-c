@@ -5,7 +5,8 @@ from .mask_paint_white import MaskPaintWhite
 from .threshold_quantize import ThresholdQuantize
 from .color_blend_lab import ColorBlendLAB
 from .mask_smooth import MaskSmooth
-from .color_saturation import AdjustSaturation   # ⬅️ novo
+from .color_saturation import AdjustSaturation
+from .image_to_latent_mix import ImageToLatentMix
 
 NODE_CLASS_MAPPINGS = {
     "BaseNodesTagManager": TagManager,
@@ -15,7 +16,8 @@ NODE_CLASS_MAPPINGS = {
     "BaseNodesThresholdQuantize": ThresholdQuantize,
     "BaseNodesColorBlendLAB": ColorBlendLAB,
     "BaseNodesMaskSmooth": MaskSmooth,
-    "BaseNodesAdjustSaturation": AdjustSaturation,  # ⬅️ novo
+    "BaseNodesAdjustSaturation": AdjustSaturation,
+    "BaseNodesImageToLatentMix": ImageToLatentMix,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -26,7 +28,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BaseNodesThresholdQuantize": "BN • Threshold (Quantize)",
     "BaseNodesColorBlendLAB": "BN • Color Blend (LAB)",
     "BaseNodesMaskSmooth": "BN • Mask Smooth",
-    "BaseNodesAdjustSaturation": "BN • Saturation",  # ⬅️ novo
+    "BaseNodesAdjustSaturation": "BN • Saturation",
+    "BaseNodesImageToLatentMix": "BN • Image→Latent (Mix)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
