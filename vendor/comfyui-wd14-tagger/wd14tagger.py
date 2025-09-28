@@ -1,50 +1,20 @@
-# https://huggingface.co/spaces/SmilingWolf/wd-v1-4-tags
-# Modified to optionally read models from an env var (WD14_MODELS_DIR),
-# and to fail gracefully (log but do not interrupt execution) when models or
-# dependencies are missing. The download function is a no-op for compatibility.
-
+import comfy.utils
 import asyncio
+import aiohttp
+import numpy as np
 import csv
 import os
 import sys
-import numpy as np
+import onnxruntime as ort
+from onnxruntime import InferenceSession
 from PIL import Image
-import aiohttp
-from aiohttp import web
-
-import comfy.utils
 from server import PromptServer
+from aiohttp import web
 import folder_paths
-from .pysssss import (
-    get_ext_dir,
-    get_comfy_dir,
-    download_to_file,              # kept for compatibility
-    update_node_status,
-    wait_for_async,
-    get_extension_config,
-    log,
-)
-
-# Try to import onnxruntime, but don't crash if it's unavailable.
-try:
-    import onnxruntime as ort
-    from onnxruntime import InferenceSession
-    _ORT_IMPORT_ERROR = None
-except Exception as _e:
-    ort = None
-    InferenceSession = None
-    _ORT_IMPORT_ERROR = _e
-
-# Ensure "comfy" local path is available (kept from original)
+from .pysssss import get_ext_dir, get_comfy_dir, download_to_file, update_node_status, wait_for_async, get_extension_config, log
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy"))
 
-# ---- Configuration ---------------------------------------------------------
-
 config = get_extension_config()
-if not isinstance(config, dict):
-    config = {}
-config.setdefault("models", {})
-config.setdefault("settings", {})
 
 defaults = {
     "model": "wd-v1-4-moat-tagger-v2",
@@ -54,204 +24,131 @@ defaults = {
     "trailing_comma": False,
     "exclude_tags": "",
     "ortProviders": ["CUDAExecutionProvider", "CPUExecutionProvider"],
-    "HF_ENDPOINT": "https://huggingface.co",
+    "HF_ENDPOINT": "https://huggingface.co"
 }
 defaults.update(config.get("settings", {}))
 
-# Resolve models_dir with environment override
-# If WD14_MODELS_DIR is set, use it. Otherwise follow the original behavior.
-models_dir_env = os.getenv("WD14_MODELS_DIR")
-if models_dir_env:
-    models_dir = models_dir_env
-    try:
-        os.makedirs(models_dir, exist_ok=True)
-    except Exception as e:
-        log(f"Unable to create WD14_MODELS_DIR at '{models_dir}': {e}", "WARN", True)
-elif "wd14_tagger" in folder_paths.folder_names_and_paths:
-    try:
-        models_dir = folder_paths.get_folder_paths("wd14_tagger")[0]
-        os.makedirs(models_dir, exist_ok=True)
-    except Exception as e:
-        # Fallback to extension-local models directory
-        log(f"Failed to use folder_paths 'wd14_tagger': {e}. Falling back to extension models dir.", "WARN", True)
-        models_dir = get_ext_dir("models", mkdir=True)
+if "wd14_tagger" in folder_paths.folder_names_and_paths:
+    models_dir = folder_paths.get_folder_paths("wd14_tagger")[0]
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
 else:
     models_dir = get_ext_dir("models", mkdir=True)
 
 known_models = list(config["models"].keys())
 
-# Log provider info (if onnxruntime is importable)
-if _ORT_IMPORT_ERROR is not None:
-    log(f"onnxruntime is not available: {_ORT_IMPORT_ERROR}", "WARN", True)
-else:
-    try:
-        log("Available ORT providers: " + ", ".join(ort.get_available_providers()), "DEBUG", True)
-    except Exception as e:
-        log(f"Failed to query ORT providers: {e}", "WARN", True)
-    log("Using ORT providers: " + ", ".join(defaults["ortProviders"]), "DEBUG", True)
-
-
-# ---- Helpers ----------------------------------------------------------------
-
-def _has_model_files(prefix_dir: str, model_name: str) -> bool:
-    """Check if both .onnx and .csv files exist for a given model."""
-    onnx_path = os.path.join(prefix_dir, f"{model_name}.onnx")
-    csv_path = os.path.join(prefix_dir, f"{model_name}.csv")
-    return os.path.isfile(onnx_path) and os.path.isfile(csv_path)
+log("Available ORT providers: " + ", ".join(ort.get_available_providers()), "DEBUG", True)
+log("Using ORT providers: " + ", ".join(defaults["ortProviders"]), "DEBUG", True)
 
 def get_installed_models():
-    """Return a list of model filenames ('.onnx') that also have a matching '.csv'."""
-    try:
-        if not os.path.isdir(models_dir):
-            return []
-        items = [f for f in os.listdir(models_dir) if f.endswith(".onnx")]
-        items = [m for m in items if os.path.exists(os.path.join(models_dir, os.path.splitext(m)[0] + ".csv"))]
-        return items
-    except Exception as e:
-        log(f"Failed to list models in '{models_dir}': {e}", "WARN", True)
-        return []
+    models = filter(lambda x: x.endswith(".onnx"), os.listdir(models_dir))
+    models = [m for m in models if os.path.exists(os.path.join(models_dir, os.path.splitext(m)[0] + ".csv"))]
+    return models
 
 
-# ---- Core Tagging -----------------------------------------------------------
-
-async def tag(image, model_name, threshold=0.35, character_threshold=0.85,
-              exclude_tags="", replace_underscore=True, trailing_comma=False,
-              client_id=None, node=None):
-    """
-    Run tagging over a single PIL image.
-    If requirements or model files are missing, log and return an empty string.
-    """
-    # Normalize model name (strip .onnx suffix if present)
+async def tag(image, model_name, threshold=0.35, character_threshold=0.85, exclude_tags="", replace_underscore=True, trailing_comma=False, client_id=None, node=None):
     if model_name.endswith(".onnx"):
-        model_name = model_name[:-5]
-
-    # Ensure ORT is available
-    if InferenceSession is None or ort is None:
-        log("onnxruntime is unavailable; skipping WD14 tagging and returning empty result.", "WARN", True)
-        return ""
-
-    # Ensure model files exist
+        model_name = model_name[0:-5]
     installed = list(get_installed_models())
-    if not any(model_name + ".onnx" == m for m in installed):
-        log(f"Model '{model_name}' not found in '{models_dir}'. "
-            f"Expected files: '{model_name}.onnx' and '{model_name}.csv'. Skipping inference.", "WARN", True)
-        # Keep UI responsive without raising
-        return ""
+    if not any(model_name + ".onnx" in s for s in installed):
+        await download_model(model_name, client_id, node)
 
-    # Try to build inference session
-    model_path = os.path.join(models_dir, model_name + ".onnx")
-    try:
-        model = InferenceSession(model_path, providers=defaults["ortProviders"])
-    except Exception as e:
-        log(f"Failed to create InferenceSession for '{model_path}': {e}. Skipping inference.", "WARN", True)
-        return ""
+    name = os.path.join(models_dir, model_name + ".onnx")
+    model = InferenceSession(name, providers=defaults["ortProviders"])
 
-    # Try to infer expected input size
-    try:
-        input_meta = model.get_inputs()[0]
-        height = input_meta.shape[1]
-        if height is None:
-            # Fallback to a common default if the model doesn't expose a static shape
-            height = 448
-    except Exception as e:
-        log(f"Failed to read model input shape: {e}. Using default height=448.", "WARN", True)
-        height = 448
+    input = model.get_inputs()[0]
+    height = input.shape[1]
 
-    # Preprocess: reduce to max size and pad with white to a square
-    try:
-        ratio = float(height) / max(image.size)
-        new_size = tuple(int(x * ratio) for x in image.size)
-        image = image.resize(new_size, Image.LANCZOS)
-        square = Image.new("RGB", (height, height), (255, 255, 255))
-        square.paste(image, ((height - new_size[0]) // 2, (height - new_size[1]) // 2))
-        image = np.array(square).astype(np.float32)
-        image = image[:, :, ::-1]  # RGB -> BGR
-        image = np.expand_dims(image, 0)
-    except Exception as e:
-        log(f"Failed during image preprocessing: {e}. Returning empty result.", "WARN", True)
-        return ""
+    # Reduz para o tamanho máximo e faz pad com branco (quadrado)
+    ratio = float(height) / max(image.size)
+    new_size = tuple([int(x * ratio) for x in image.size])
+    image = image.resize(new_size, Image.LANCZOS)
+    square = Image.new("RGB", (height, height), (255, 255, 255))
+    square.paste(image, ((height - new_size[0]) // 2, (height - new_size[1]) // 2))
 
-    # Read tags from CSV
+    image = np.array(square).astype(np.float32)
+    image = image[:, :, ::-1]  # RGB -> BGR
+    image = np.expand_dims(image, 0)
+
+    # Lê todas as tags do CSV e localiza inícios de categorias
     tags = []
     general_index = None
     character_index = None
-    csv_path = os.path.join(models_dir, model_name + ".csv")
-    try:
-        with open(csv_path, encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)  # skip header
-            for row in reader:
-                if general_index is None and len(row) > 2 and row[2] == "0":
-                    general_index = reader.line_num - 2
-                elif character_index is None and len(row) > 2 and row[2] == "4":
-                    character_index = reader.line_num - 2
-                tag_name = row[1] if len(row) > 1 else ""
-                if replace_underscore:
-                    tags.append(tag_name.replace("_", " "))
-                else:
-                    tags.append(tag_name)
-    except Exception as e:
-        log(f"Failed to read CSV '{csv_path}': {e}. Returning empty result.", "WARN", True)
-        return ""
+    with open(os.path.join(models_dir, model_name + ".csv")) as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            if general_index is None and row[2] == "0":
+                general_index = reader.line_num - 2
+            elif character_index is None and row[2] == "4":
+                character_index = reader.line_num - 2
+            if replace_underscore:
+                tags.append(row[1].replace("_", " "))
+            else:
+                tags.append(row[1])
 
-    # Run inference
-    try:
-        label_name = model.get_outputs()[0].name
-        probs = model.run([label_name], {model.get_inputs()[0].name: image})[0]
-    except Exception as e:
-        log(f"Inference failed: {e}. Returning empty result.", "WARN", True)
-        return ""
+    label_name = model.get_outputs()[0].name
+    probs = model.run([label_name], {input.name: image})[0]
 
-    # Postprocess
-    try:
-        result = list(zip(tags, probs[0]))
-        # rating = max(result[:general_index], key=lambda x: x[1])  # unused
-        if general_index is None or character_index is None:
-            # Fallback: treat everything as general if CSV didn't expose indices
-            general_index = 0 if general_index is None else general_index
-            character_index = len(result) if character_index is None else character_index
+    result = list(zip(tags, probs[0]))
 
-        general = [item for item in result[general_index:character_index] if item[1] > threshold]
-        character = [item for item in result[character_index:] if item[1] > character_threshold]
+    general = [item for item in result[general_index:character_index] if item[1] > threshold]
+    character = [item for item in result[character_index:] if item[1] > character_threshold]
 
-        all_tags = character + general
-        remove = [s.strip() for s in (exclude_tags or "").lower().split(",") if s.strip()]
-        all_tags = [tag for tag in all_tags if tag[0] not in remove]
+    all = character + general
+    remove = [s.strip() for s in exclude_tags.lower().split(",")]
+    all = [tag for tag in all if tag[0] not in remove]
 
-        res = ("" if trailing_comma else ", ").join(
-            (item[0].replace("(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for item in all_tags)
-        )
-        print(res)
-        return res
-    except Exception as e:
-        log(f"Failed during postprocessing: {e}. Returning empty result.", "WARN", True)
-        return ""
+    res = ("" if trailing_comma else ", ").join(
+        (item[0].replace("(", "\\(").replace(")", "\\)") + (", " if trailing_comma else "") for item in all)
+    )
 
+    print(res)
+    return res
 
-# ---- Download (Fake / No-Op) -----------------------------------------------
 
 async def download_model(model, client_id, node):
-    """
-    Fake download function kept only for compatibility.
-    It logs a message and returns HTTP 200 without downloading.
-    """
-    log(f"Download disabled: please place '{model}.onnx' and '{model}.csv' in '{models_dir}'.", "INFO", True)
-    update_node_status(client_id, node, None)
+    hf_endpoint = os.getenv("HF_ENDPOINT", defaults["HF_ENDPOINT"])
+    if not hf_endpoint.startswith("https://"):
+        hf_endpoint = f"https://{hf_endpoint}"
+    if hf_endpoint.endswith("/"):
+        hf_endpoint = hf_endpoint.rstrip("/")
+
+    url = config["models"][model]
+    url = url.replace("{HF_ENDPOINT}", hf_endpoint)
+    url = f"{url}/resolve/main/"
+    async with aiohttp.ClientSession(loop=asyncio.get_event_loop()) as session:
+        async def update_callback(perc):
+            nonlocal client_id
+            message = ""
+            if perc < 100:
+                message = f"Downloading {model}"
+            update_node_status(client_id, node, message, perc)
+
+        try:
+            await download_to_file(
+                f"{url}model.onnx", os.path.join(models_dir, f"{model}.onnx"), update_callback, session=session)
+            await download_to_file(
+                f"{url}selected_tags.csv", os.path.join(models_dir, f"{model}.csv"), update_callback, session=session)
+        except aiohttp.client_exceptions.ClientConnectorError as err:
+            log("Unable to download model. Download files manually or try using a HF mirror/proxy website by setting the environment variable HF_ENDPOINT=https://.....", "ERROR", True)
+            raise
+
+        update_node_status(client_id, node, None)
+
     return web.Response(status=200)
 
-
-# ---- HTTP Endpoint ----------------------------------------------------------
 
 @PromptServer.instance.routes.get("/pysssss/wd14tagger/tag")
 async def get_tags(request):
     if "filename" not in request.rel_url.query:
         return web.Response(status=404)
 
-    typ = request.query.get("type", "output")
-    if typ not in ["output", "input", "temp"]:
+    type = request.query.get("type", "output")
+    if type not in ["output", "input", "temp"]:
         return web.Response(status=400)
 
-    target_dir = get_comfy_dir(typ)
+    target_dir = get_comfy_dir(type)
     image_path = os.path.abspath(os.path.join(
         target_dir, request.query.get("subfolder", ""), request.query["filename"]))
     c = os.path.commonpath((image_path, target_dir))
@@ -265,28 +162,16 @@ async def get_tags(request):
 
     models = get_installed_models()
     default = defaults["model"] + ".onnx"
-    # Choose default, or first available, or skip gracefully if none
-    if len(models) == 0:
-        log(f"No WD14 models found in '{models_dir}'. Returning empty tags.", "WARN", True)
-        return web.json_response(await tag(image, defaults["model"], client_id=request.rel_url.query.get("clientId", ""), node=request.rel_url.query.get("node", "")))
+    model = default if default in models else models[0]
 
-    model_choice = default if default in models else os.path.splitext(models[0])[0]
-    return web.json_response(await tag(image, model_choice, client_id=request.rel_url.query.get("clientId", ""), node=request.rel_url.query.get("node", "")))
+    return web.json_response(await tag(image, model, client_id=request.rel_url.query.get("clientId", ""), node=request.rel_url.query.get("node", "")))
 
-
-# ---- ComfyUI Node -----------------------------------------------------------
 
 class WD14Tagger:
     @classmethod
     def INPUT_TYPES(s):
-        # Include known models from config plus any extra .onnx present in the directory
-        try:
-            extra = [name for name, _ in (os.path.splitext(m) for m in get_installed_models()) if name not in known_models]
-        except Exception:
-            extra = []
+        extra = [name for name, _ in (os.path.splitext(m) for m in get_installed_models()) if name not in known_models]
         models = known_models + extra
-        if defaults["model"] not in models:
-            models = [defaults["model"]] + models
         return {"required": {
             "image": ("IMAGE", ),
             "model": (models, {"default": defaults["model"]}),
@@ -297,28 +182,35 @@ class WD14Tagger:
             "exclude_tags": ("STRING", {"default": defaults["exclude_tags"]}),
         }}
 
-    RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "tag"
+    RETURN_TYPES = ("STRING",)        # ← agora é só uma string
+    # OUTPUT_IS_LIST removido / False  → saída simples (não lista)
+    FUNCTION = "tag_batch"
     OUTPUT_NODE = True
 
     CATEGORY = "image"
 
-    def tag(self, image, model, threshold, character_threshold,
-            exclude_tags="", replace_underscore=False, trailing_comma=False):
+    def tag_batch(self, image, model, threshold, character_threshold, exclude_tags="", replace_underscore=False, trailing_comma=False):
+        """
+        Processa o batch e retorna UMA ÚNICA STRING.
+        - Se B==1: a própria string de tags.
+        - Se B>1 : junta cada linha (uma por imagem) com '\n'.
+        """
         tensor = image * 255
         tensor = np.array(tensor, dtype=np.uint8)
 
         pbar = comfy.utils.ProgressBar(tensor.shape[0])
-        tags = []
+        tag_lines = []
         for i in range(tensor.shape[0]):
-            img = Image.fromarray(tensor[i])
-            tags.append(wait_for_async(lambda: tag(
-                img, model, threshold, character_threshold, exclude_tags,
-                replace_underscore, trailing_comma
-            )))
+            pil_img = Image.fromarray(tensor[i])
+            line = wait_for_async(lambda: tag(pil_img, model, threshold, character_threshold, exclude_tags, replace_underscore, trailing_comma))
+            tag_lines.append(line)
             pbar.update(1)
-        return {"ui": {"tags": tags}, "result": (tags,)}
+
+        # Uma única string (batch>1 vira várias linhas)
+        out_str = "\n".join(tag_lines)
+
+        # UI opcional: mostra como uma lista com 1 item (a string final)
+        return {"ui": {"tags": [out_str]}, "result": (out_str,)}
 
 
 NODE_CLASS_MAPPINGS = {
