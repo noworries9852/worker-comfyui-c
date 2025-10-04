@@ -12,6 +12,7 @@ from server import PromptServer
 from aiohttp import web
 import folder_paths
 from .pysssss import get_ext_dir, get_comfy_dir, download_to_file, update_node_status, wait_for_async, get_extension_config, log
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy"))
 
 config = get_extension_config()
@@ -28,12 +29,33 @@ defaults = {
 }
 defaults.update(config.get("settings", {}))
 
-if "wd14_tagger" in folder_paths.folder_names_and_paths:
-    models_dir = folder_paths.get_folder_paths("wd14_tagger")[0]
-    if not os.path.exists(models_dir):
-        os.makedirs(models_dir)
-else:
-    models_dir = get_ext_dir("models", mkdir=True)
+# -------------------------------------------------------------------------
+# Sempre usar a pasta 'models/comfyui-wd14-tagger' (não em custom_nodes)
+# e registrar/forçar esse caminho no registry do ComfyUI.
+# -------------------------------------------------------------------------
+MODELS_SUBDIR = "comfyui-wd14-tagger"
+models_dir = os.path.join(folder_paths.models_dir, MODELS_SUBDIR)
+os.makedirs(models_dir, exist_ok=True)
+
+def _register_models_dir(path: str):
+    try:
+        # API nova do ComfyUI
+        folder_paths.add_model_folder_path("wd14_tagger", path)
+    except Exception:
+        # Fallback para versões antigas
+        exts = set()
+        if "wd14_tagger" in getattr(folder_paths, "folder_names_and_paths", {}):
+            val = folder_paths.folder_names_and_paths["wd14_tagger"]
+            if isinstance(val, tuple) and len(val) > 1 and isinstance(val[1], set):
+                exts = val[1]
+        if not exts:
+            # Extensões úteis para listagem (não atrapalha mesmo que não use)
+            exts = {".onnx", ".csv"}
+        folder_paths.folder_names_and_paths["wd14_tagger"] = ([path], exts)
+
+_register_models_dir(models_dir)
+log(f"[wd14] models_dir => {models_dir}", "DEBUG", True)
+# -------------------------------------------------------------------------
 
 known_models = list(config["models"].keys())
 
@@ -182,8 +204,7 @@ class WD14Tagger:
             "exclude_tags": ("STRING", {"default": defaults["exclude_tags"]}),
         }}
 
-    RETURN_TYPES = ("STRING",)        # ← agora é só uma string
-    # OUTPUT_IS_LIST removido / False  → saída simples (não lista)
+    RETURN_TYPES = ("STRING",)        # saída única como string
     FUNCTION = "tag_batch"
     OUTPUT_NODE = True
 
@@ -206,10 +227,7 @@ class WD14Tagger:
             tag_lines.append(line)
             pbar.update(1)
 
-        # Uma única string (batch>1 vira várias linhas)
         out_str = "\n".join(tag_lines)
-
-        # UI opcional: mostra como uma lista com 1 item (a string final)
         return {"ui": {"tags": [out_str]}, "result": (out_str,)}
 
 
